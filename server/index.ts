@@ -69,15 +69,26 @@ app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
 app.get('/api/tenant/:company/contacts/export',async(_q,r)=>{r.json({leads:await tenant(r,async c=>(await c.query('SELECT name,phone,stage,value,company_name AS company,email,notes,created_at AS "createdAt" FROM contacts ORDER BY created_at')).rows),exportDate:new Date().toISOString()});});
 app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes}=q.body??{};if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5 WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
-async function evolution(r:express.Response,path:string,body?:unknown){
+async function evolution(r:express.Response,path:string,body?:unknown,method?:string){
  const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
  if(!base||!key||!instance||company!==r.locals.company)throw Error('Evolution not configured for company');
  if(new URL(base).protocol!=='https:')throw Error('Evolution HTTPS required');
- const response=await fetch(base.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:body===undefined?'GET':'POST',headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
+ const response=await fetch(base.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:method??(body===undefined?'GET':'POST'),headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
  if(!response.ok)throw Error('Evolution request failed');return response.json();
 }
 app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
+app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
+ if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ try{const state=await evolution(r,'/instance/connectionState');if((state.instance?.state??state.state)==='open'){r.json({state:'open'});return;}
+ const x=await evolution(r,'/instance/connect');const raw=x.base64??x.qrcode?.base64;const qr=typeof raw==='string'&&raw.length<2000000&&/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(raw)?raw:null;
+ if(!qr){r.status(502).json({error:'Evolution no devolvió un QR PNG'});return;}r.json({state:'connecting',qr});
+ }catch{r.status(502).json({error:'No se pudo obtener QR de Evolution'});}
+});
+app.post('/api/tenant/:company/whatsapp/disconnect',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
+ if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ try{await evolution(r,'/instance/logout',undefined,'DELETE');r.json({ok:true});}catch{r.status(502).json({error:'No se pudo desvincular WhatsApp'});}
+});
 app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
  if(r.locals.role==='viewer'){r.sendStatus(403);return;}
  const result=await evolution(r,'/chat/findMessages',{where:{},page:1,offset:100});
