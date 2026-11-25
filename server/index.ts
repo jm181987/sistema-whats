@@ -15,6 +15,7 @@ async function initialize(){
  if(role.rows[0].rolsuper||role.rows[0].rolbypassrls) throw Error('Unsafe database role');
  await c.query('CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)');
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=1')).rowCount){await c.query(await readFile('migrations/001.sql','utf8'));await c.query('INSERT INTO schema_migrations VALUES(1)');}
+ if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=2')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN stage text NOT NULL DEFAULT 'nuevo', ADD COLUMN value numeric(14,2) NOT NULL DEFAULT 0, ADD COLUMN company_name text NOT NULL DEFAULT '', ADD COLUMN email text NOT NULL DEFAULT '', ADD COLUMN notes text NOT NULL DEFAULT ''");await c.query('INSERT INTO schema_migrations VALUES(2)');}
  const {BOOTSTRAP_EMAIL:e,BOOTSTRAP_PASSWORD:p,BOOTSTRAP_COMPANY:n}=process.env;
  if(!(await c.query('SELECT 1 FROM users LIMIT 1')).rowCount){
  if(!e||!p||p.length<14||!n)throw Error('Bootstrap email, company and password (14+ chars) required');
@@ -42,6 +43,21 @@ app.use('/api/tenant/:company',async(q,r,next)=>{const id=q.params.company;if(!/
 async function tenant(r:express.Response,fn:(c:pg.PoolClient)=>Promise<unknown>){const c=await pool.connect();try{await c.query('BEGIN');await c.query("SELECT set_config('app.company_id',$1,true)",[r.locals.company]);const result=await fn(c);await c.query('COMMIT');return result;}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}}
 app.get('/api/tenant/:company/contacts',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query('SELECT * FROM contacts ORDER BY created_at DESC LIMIT 500')).rows)));
 app.post('/api/tenant/:company/contacts',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {name,phone}=q.body??{};if(typeof name!=='string'||!name.trim()||name.length>200||typeof phone!=='string'||!/^\+?[1-9]\d{7,14}$/.test(phone)){r.sendStatus(400);return;}r.status(201).json(await tenant(r,async c=>(await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) RETURNING *',[r.locals.company,name.trim(),phone.replace(/^\+/,'')])).rows[0]));});
+app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes}=q.body??{};if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5 WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
+app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
+async function evolution(r:express.Response,path:string,body?:unknown){
+ const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
+ if(!base||!key||!instance||company!==r.locals.company)throw Error('Evolution not configured for company');
+ if(new URL(base).protocol!=='https:')throw Error('Evolution HTTPS required');
+ const response=await fetch(base.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:body===undefined?'GET':'POST',headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
+ if(!response.ok)throw Error('Evolution request failed');return response.json();
+}
+app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
+app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
+app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
+ const allowed=await tenant(r,async c=>(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount);if(!allowed){r.status(403).json({error:'Contact consent required'});return;}
+ const result=await evolution(r,'/message/sendText',{number:phone,text});await tenant(r,async c=>c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[r.locals.company,phone,JSON.stringify({phone,text,direction:'sent',providerId:result.key?.id})]));r.json({ok:true});});
+app.post('/api/tenant/:company/contacts/:id/consent',async(q,r)=>{if(!['owner','admin'].includes(r.locals.role)||typeof q.body?.consent!=='boolean'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('UPDATE contacts SET consent_at=CASE WHEN $1 THEN now() ELSE NULL END,opted_out=NOT $1 WHERE id=$2',[q.body.consent,q.params.id]));r.json({ok:true});});
 app.use('/api',(_q,r)=>r.sendStatus(404));
 app.use(express.static('dist/web'));app.get('/',(_q,r)=>r.sendFile('index.html',{root:'dist/web'}));
 app.use((e:any,_q:express.Request,r:express.Response,_n:express.NextFunction)=>{console.error('Request failed',e.code??'internal');r.status(e.code==='23505'?409:500).json({error:'Request failed'});});
