@@ -78,6 +78,13 @@ async function evolution(r:express.Response,path:string,body?:unknown){
 }
 app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
+app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
+ if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ try{const state=await evolution(r,'/instance/connectionState');if((state.instance?.state??state.state)==='open'){r.json({state:'open'});return;}
+ const x=await evolution(r,'/instance/connect');const raw=x.base64??x.qrcode?.base64;const qr=typeof raw==='string'&&raw.length<2000000&&/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(raw)?raw:null;
+ if(!qr){r.status(502).json({error:'Evolution no devolvió un QR PNG'});return;}r.json({state:'connecting',qr});
+ }catch{r.status(502).json({error:'No se pudo obtener QR de Evolution'});}
+});
 app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
  if(r.locals.role==='viewer'){r.sendStatus(403);return;}
  const result=await evolution(r,'/chat/findMessages',{where:{},page:1,offset:100});
