@@ -66,6 +66,21 @@ async function evolution(r:express.Response,path:string,body?:unknown){
 }
 app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
+app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
+ if(r.locals.role==='viewer'){r.sendStatus(403);return;}
+ const result=await evolution(r,'/chat/findMessages',{where:{},page:1,offset:100});
+ const records=Array.isArray(result)?result:result.messages?.records??result.records??result.messages;
+ if(!Array.isArray(records)){r.status(502).json({error:'Unexpected Evolution response'});return;}
+ let imported=0;
+ await tenant(r,async c=>{for(const m of records.slice(0,100)){const k=m?.key,jid=k?.remoteJid;
+ if(typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
+ const phone=jid.split('@')[0],message=m.message?.conversation??m.message?.extendedTextMessage?.text;
+ if(typeof message!=='string'||!message.trim())continue;
+ const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
+ await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
+ const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id}),k.id,date]);imported+=x.rowCount??0;
+ }});r.json({imported});
+});
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
  const allowed=await tenant(r,async c=>(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount);if(!allowed){r.status(403).json({error:'Contact consent required'});return;}
