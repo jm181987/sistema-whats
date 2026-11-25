@@ -1,7 +1,3 @@
 # Sistema Whats — KNJ
 
-Multi-tenant WhatsApp marketing platform. PostgreSQL, Node.js, TypeScript, React, Evolution API, Coolify.
-
-Initial development; not production-ready. No credentials in Git. Configure DATABASE_URL with TLS, bootstrap credentials and Evolution API secrets in Coolify. Rotate any previously shared passwords.
-
-Modules: dashboard, conversations, contacts, campaigns, pipeline, chatbot, automations, proposals, calendar, referrals, reports, administration. Campaign delivery requires consent and opt-out enforcement.
+Initial foundation, not production-ready. Node 22, TypeScript, React, PostgreSQL, Evolution API, Coolify. Run npm install, npm run build, npm start. Docker builds the app. Set DATABASE_URL (TLS verified), BOOTSTRAP_EMAIL, BOOTSTRAP_PASSWORD and BOOTSTRAP_COMPANY for initial setup; remove bootstrap secrets after first start. HTTPS required. No public registration. Modules beyond contacts are schema/navigation foundations only. Evolution adapter is not wired to sending or webhooks. Rotate shared database credentials. Use a dedicated non-superuser database role without BYPASSRLS. Validate in staging before production.
