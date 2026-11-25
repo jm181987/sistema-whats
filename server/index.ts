@@ -36,6 +36,18 @@ app.post('/api/login',rateLimit({windowMs:900000,limit:15}),async(q,r)=>{
  r.cookie('sw_session',token,{httpOnly:true,secure:true,sameSite:'strict',maxAge:28800000,path:'/'}).json({ok:true});
 });
 function token(q:express.Request){return (q.headers.cookie??'').match(/(?:^|;\s*)sw_session=([a-f0-9]{64})(?:;|$)/)?.[1]??'';}
+app.post('/api/webhooks/evolution/:secret',async(q,r)=>{
+ const secret=process.env.EVOLUTION_WEBHOOK_SECRET,company=process.env.EVOLUTION_COMPANY_ID,instance=process.env.EVOLUTION_INSTANCE;
+ if(!secret||secret.length<32||!company||!instance||hash(q.params.secret)!==hash(secret)){r.sendStatus(404);return;}
+ const event=q.body;if(event?.instance!==instance||String(event?.event).toLowerCase().replace(/_/g,'.')!=='messages.upsert'){r.json({ok:true});return;}
+ const items=Array.isArray(event.data)?event.data:[event.data];
+ r.locals.company=company;
+ await tenant(r,async c=>{for(const m of items){const key=m?.key;const jid=key?.remoteJid;if(key?.fromMe!==false||typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof key.id!=='string'||key.id.length>200)continue;
+ const phone=jid.split('@')[0],message=m.message?.conversation??m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim())continue;
+ await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[company+':'+key.id]);
+ await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id}),key.id]);}});
+ r.json({ok:true});
+});
 app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at>now()',[hash(token(q))])).rows[0];if(!s){r.sendStatus(401);return;}r.locals.user=s.user_id;next();});
 app.post('/api/logout',async(q,r)=>{await pool.query('DELETE FROM sessions WHERE token_hash=$1',[hash(token(q))]);r.clearCookie('sw_session',{secure:true,httpOnly:true,sameSite:'strict',path:'/'}).json({ok:true});});
 app.get('/api/companies',async(_q,r)=>{r.json((await pool.query('SELECT c.id,c.name,m.role FROM companies c JOIN memberships m ON m.company_id=c.id WHERE m.user_id=$1',[r.locals.user])).rows);});
@@ -43,6 +55,18 @@ app.use('/api/tenant/:company',async(q,r,next)=>{const id=q.params.company;if(!/
 async function tenant(r:express.Response,fn:(c:pg.PoolClient)=>Promise<unknown>){const c=await pool.connect();try{await c.query('BEGIN');await c.query("SELECT set_config('app.company_id',$1,true)",[r.locals.company]);const result=await fn(c);await c.query('COMMIT');return result;}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}}
 app.get('/api/tenant/:company/contacts',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query('SELECT * FROM contacts ORDER BY created_at DESC LIMIT 500')).rows)));
 app.post('/api/tenant/:company/contacts',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {name,phone}=q.body??{};if(typeof name!=='string'||!name.trim()||name.length>200||typeof phone!=='string'||!/^\+?[1-9]\d{7,14}$/.test(phone)){r.sendStatus(400);return;}r.status(201).json(await tenant(r,async c=>(await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) RETURNING *',[r.locals.company,name.trim(),phone.replace(/^\+/,'')])).rows[0]));});
+app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
+ if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ const rows=q.body?.leads;if(!Array.isArray(rows)||rows.length>100){r.sendStatus(400);return;}
+ let added=0,skipped=0;
+ await tenant(r,async c=>{for(const l of rows){const phone=typeof l?.phone==='string'?l.phone.replace(/[+ ()-]/g,''):'',name=typeof l?.name==='string'?l.name.trim():'',value=Number(l?.value??0),stage=l?.stage??'nuevo';
+ if(!name||name.length>200||!/^[1-9]\d{7,14}$/.test(phone)||!Number.isFinite(value)||value<0||value>999999999999||!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)){skipped++;continue;}
+ const fields=[l.company_name??l.company??'',l.email??'',l.notes??''];if(!fields.every(x=>typeof x==='string'&&x.length<=2000)){skipped++;continue;}
+ const date=new Date(l.createdAt??l.created_at??Date.now());if(!Number.isFinite(date.getTime())){skipped++;continue;}
+ const x=await c.query('INSERT INTO contacts(company_id,name,phone,stage,value,company_name,email,notes,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,name,phone,stage,value,...fields,date]);added+=x.rowCount??0;skipped+=1-(x.rowCount??0);
+ }});r.json({added,skipped});
+});
+app.get('/api/tenant/:company/contacts/export',async(_q,r)=>{r.json({leads:await tenant(r,async c=>(await c.query('SELECT name,phone,stage,value,company_name AS company,email,notes,created_at AS "createdAt" FROM contacts ORDER BY created_at')).rows),exportDate:new Date().toISOString()});});
 app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes}=q.body??{};if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5 WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
 async function evolution(r:express.Response,path:string,body?:unknown){
@@ -52,7 +76,23 @@ async function evolution(r:express.Response,path:string,body?:unknown){
  const response=await fetch(base.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:body===undefined?'GET':'POST',headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
  if(!response.ok)throw Error('Evolution request failed');return response.json();
 }
+app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
+app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
+ if(r.locals.role==='viewer'){r.sendStatus(403);return;}
+ const result=await evolution(r,'/chat/findMessages',{where:{},page:1,offset:100});
+ const records=Array.isArray(result)?result:result.messages?.records??result.records??result.messages;
+ if(!Array.isArray(records)){r.status(502).json({error:'Unexpected Evolution response'});return;}
+ let imported=0;
+ await tenant(r,async c=>{for(const m of records.slice(0,100)){const k=m?.key,jid=k?.remoteJid;
+ if(typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
+ const phone=jid.split('@')[0],message=m.message?.conversation??m.message?.extendedTextMessage?.text;
+ if(typeof message!=='string'||!message.trim())continue;
+ const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
+ await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
+ const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id}),k.id,date]);imported+=x.rowCount??0;
+ }});r.json({imported});
+});
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
  const allowed=await tenant(r,async c=>(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount);if(!allowed){r.status(403).json({error:'Contact consent required'});return;}
