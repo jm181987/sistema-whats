@@ -71,19 +71,25 @@ app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='v
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
 async function evolution(r:express.Response,path:string,body?:unknown,method?:string){
  const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
- if(!base||!key||!instance||company!==r.locals.company)throw Error('Evolution not configured for company');
- if(new URL(base).protocol!=='https:')throw Error('Evolution HTTPS required');
+ if(!base||!key||!instance||company!==r.locals.company)throw Error('Revisá EVOLUTION_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE y EVOLUTION_COMPANY_ID');
+ if(new URL(base).protocol!=='https:')throw Error('EVOLUTION_URL debe usar HTTPS');
  const response=await fetch(base.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:method??(body===undefined?'GET':'POST'),headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
- if(!response.ok)throw Error('Evolution request failed');return response.json();
+ if(!response.ok)throw Error('Evolution respondió HTTP '+response.status);return response.json();
 }
 app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
 app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
- try{const state=await evolution(r,'/instance/connectionState');if((state.instance?.state??state.state)==='open'){r.json({state:'open'});return;}
- const x=await evolution(r,'/instance/connect');const raw=x.base64??x.qrcode?.base64;const qr=typeof raw==='string'&&raw.length<2000000&&/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(raw)?raw:null;
- if(!qr){r.status(502).json({error:'Evolution no devolvió un QR PNG'});return;}r.json({state:'connecting',qr});
- }catch{r.status(502).json({error:'No se pudo obtener QR de Evolution'});}
+ try{const state=await evolution(r,'/instance/connectionState').catch(()=>null);if((state?.instance?.state??state?.state)==='open'){r.json({state:'open'});return;}
+ const x=await evolution(r,'/instance/connect');const raw=x.base64??x.qrcode?.base64??x.data?.base64??x.data?.qrcode?.base64;
+ const image=typeof raw==='string'&&raw.length<2000000?raw.trim():'';
+ const qr=/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(image)?image:/^iVBORw0KGgo[A-Za-z0-9+/=]+$/.test(image)?'data:image/png;base64,'+image:null;
+ if(qr){r.json({state:'connecting',qr});return;}
+ const code=x.code??x.qrcode?.code??x.data?.code??x.data?.qrcode?.code;
+ if(typeof code==='string'&&code.length>0&&code.length<4096){r.json({state:'connecting',code});return;}
+ if((x.instance?.state??x.state)==='open'){r.json({state:'open'});return;}
+ r.status(502).json({error:'Evolution no devolvió QR. Verificá que la instancia exista y esté desconectada.'});
+ }catch(e){const msg=e instanceof Error?e.message:'';r.status(502).json({error:/^(Revisá EVOLUTION_|EVOLUTION_URL debe|Evolution respondió HTTP \d{3}$)/.test(msg)?msg:'No se pudo comunicar con Evolution. Revisá red, certificado HTTPS y disponibilidad.'});}
 });
 app.post('/api/tenant/:company/whatsapp/disconnect',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
