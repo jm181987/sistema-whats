@@ -25,7 +25,7 @@ async function initialize(){
  await c.query('COMMIT');}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
 }
 await initialize();
-const app=express();app.disable('x-powered-by');app.use(express.json({limit:'64kb'}));
+const app=express();app.disable('x-powered-by');app.use(express.json({limit:'23mb'}));
 app.use('/api',(req,res,next)=>{res.set('Cache-Control','no-store');if(!['GET','HEAD'].includes(req.method)&&!req.is('application/json')){res.sendStatus(415);return;}next();});
 app.get('/health',async(_q,r)=>{await pool.query('SELECT 1');r.json({ok:true});});
 app.post('/api/login',rateLimit({windowMs:900000,limit:15}),async(q,r)=>{
@@ -36,6 +36,11 @@ app.post('/api/login',rateLimit({windowMs:900000,limit:15}),async(q,r)=>{
  r.cookie('sw_session',token,{httpOnly:true,secure:true,sameSite:'strict',maxAge:28800000,path:'/'}).json({ok:true});
 });
 function token(q:express.Request){return (q.headers.cookie??'').match(/(?:^|;\s*)sw_session=([a-f0-9]{64})(?:;|$)/)?.[1]??'';}
+function mediaInfo(m:any){
+ const msg=m?.message??{};for(const kind of ['image','video','audio']){const item=msg[kind+'Message'];if(item)return {kind,text:typeof item.caption==='string'?item.caption:'['+kind+']',mime:typeof item.mimetype==='string'?item.mimetype.split(';')[0]:'',ptt:kind==='audio'&&item.ptt===true};}return null;
+}
+const mediaTypes:Record<string,string[]>={image:['image/jpeg','image/png','image/webp'],video:['video/mp4','video/webm'],audio:['audio/ogg','audio/mpeg','audio/mp4','audio/wav','audio/webm','audio/aac']};
+function validMedia(kind:string,mime:string,b64:string){return !!mediaTypes[kind]?.includes(mime)&&typeof b64==='string'&&b64.length>0&&b64.length<=22369624&&/^[A-Za-z0-9+/]+={0,2}$/.test(b64)&&Buffer.from(b64,'base64').length<=16777216;}
 app.post('/api/webhooks/evolution/:secret',async(q,r)=>{
  const secret=process.env.EVOLUTION_WEBHOOK_SECRET,company=process.env.EVOLUTION_COMPANY_ID,instance=process.env.EVOLUTION_INSTANCE;
  if(!secret||secret.length<32||!company||!instance||hash(q.params.secret)!==hash(secret)){r.sendStatus(404);return;}
@@ -43,9 +48,9 @@ app.post('/api/webhooks/evolution/:secret',async(q,r)=>{
  const items=Array.isArray(event.data)?event.data:[event.data];
  r.locals.company=company;
  await tenant(r,async c=>{for(const m of items){const key=m?.key;const jid=key?.remoteJid;if(key?.fromMe!==false||typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof key.id!=='string'||key.id.length>200)continue;
- const phone=jid.split('@')[0],message=m.message?.conversation??m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim())continue;
+ const phone=jid.split('@')[0],media=mediaInfo(m),message=media?.text??m.message?.conversation??m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim())continue;
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[company+':'+key.id]);
- await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id}),key.id]);}});
+ await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media}),key.id]);}});
  r.json({ok:true});
 });
 app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at>now()',[hash(token(q))])).rows[0];if(!s){r.sendStatus(401);return;}r.locals.user=s.user_id;next();});
@@ -108,14 +113,29 @@ app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
  let imported=0;
  await tenant(r,async c=>{for(const m of records.slice(0,100)){const k=m?.key,jid=k?.remoteJid;
  if(typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
- const phone=jid.split('@')[0],message=m.message?.conversation??m.message?.extendedTextMessage?.text;
+ const phone=jid.split('@')[0],media=mediaInfo(m),message=media?.text??m.message?.conversation??m.message?.extendedTextMessage?.text;
  if(typeof message!=='string'||!message.trim())continue;
  const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
- const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id}),k.id,date]);imported+=x.rowCount??0;
+ const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media}),k.id,date]);imported+=x.rowCount??0;
  }});r.json({imported});
 });
-app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
+app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data - 'mediaBase64' AS data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
+app.get('/api/tenant/:company/whatsapp/media/:id',async(q,r)=>{
+ const row:any=await tenant(r,async c=>(await c.query('SELECT data FROM conversations WHERE id=$1',[q.params.id])).rows[0]);const d=row?.data;if(!d?.media){r.sendStatus(404);return;}
+ let b64=d.mediaBase64,mime=d.media.mime;
+ if(!b64){const x=await evolution(r,'/chat/getBase64FromMediaMessage',{message:{key:{id:d.providerId}},convertToMp4:false});b64=x.base64;mime=(x.mimetype??mime).split(';')[0];}
+ if(typeof b64==='string'&&b64.startsWith('data:'))b64=b64.split(',')[1];
+ if(!validMedia(d.media.kind,mime,b64)){r.status(415).json({error:'Formato multimedia no compatible'});return;}
+ const bytes=Buffer.from(b64,'base64');r.set({'Content-Type':mime,'X-Content-Type-Options':'nosniff','Content-Disposition':'inline','Accept-Ranges':'bytes'});const range=q.headers.range?.match(/^bytes=(\d+)-(\d*)$/);if(range){const start=Number(range[1]),end=range[2]?Math.min(Number(range[2]),bytes.length-1):bytes.length-1;if(start>end||start>=bytes.length){r.set('Content-Range','bytes */'+bytes.length).sendStatus(416);return;}r.status(206).set('Content-Range','bytes '+start+'-'+end+'/'+bytes.length).send(bytes.subarray(start,end+1));return;}r.send(bytes);
+});
+app.post('/api/tenant/:company/whatsapp/send-media',rateLimit({windowMs:60000,limit:20}),async(q,r)=>{
+ if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,kind,mime,base64,caption='',ptt=false}=q.body??{};
+ if(typeof phone!=='string'||!/^[1-9]\d{7,14}$/.test(phone)||typeof kind!=='string'||typeof mime!=='string'||!validMedia(kind,mime,base64)||typeof caption!=='string'||caption.length>4000){r.sendStatus(400);return;}
+ const allowed=await tenant(r,async c=>{await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);return !!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND NOT opted_out',[phone])).rowCount;});if(!allowed){r.sendStatus(403);return;}
+ const result=kind==='audio'&&ptt?await evolution(r,'/message/sendWhatsAppAudio',{number:phone,audio:base64}):await evolution(r,'/message/sendMedia',{number:phone,mediatype:kind,mimetype:mime,media:base64,caption,fileName:'archivo.'+mime.split('/')[1]});
+ await tenant(r,async c=>c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[r.locals.company,phone,JSON.stringify({phone,text:caption||'['+kind+']',direction:'sent',providerId:result.key?.id,media:{kind,mime,ptt},mediaBase64:base64})]));r.json({ok:true});
+});
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
  const allowed=await tenant(r,async c=>{
  await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);
