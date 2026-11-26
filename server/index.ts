@@ -41,17 +41,23 @@ function mediaInfo(m:any){
 }
 const mediaTypes:Record<string,string[]>={image:['image/jpeg','image/png','image/webp'],video:['video/mp4','video/webm'],audio:['audio/ogg','audio/mpeg','audio/mp4','audio/wav','audio/webm','audio/aac']};
 function validMedia(kind:string,mime:string,b64:string){return !!mediaTypes[kind]?.includes(mime)&&typeof b64==='string'&&b64.length>0&&b64.length<=22369624&&/^[A-Za-z0-9+/]+={0,2}$/.test(b64)&&Buffer.from(b64,'base64').length<=16777216;}
-app.post('/api/webhooks/evolution/:secret',async(q,r)=>{
+function directPhone(key:any):string|null{
+ for(const jid of [key?.remoteJidAlt,key?.remoteJid,key?.senderPn,key?.participantAlt]){if(typeof jid==='string'&&/^\d{8,15}(?::\d+)?@s\.whatsapp\.net$/.test(jid))return jid.split('@')[0].split(':')[0];}return null;
+}
+function unwrapMessage(m:any){let msg=m?.message??{};for(let i=0;i<5;i++){const nested=msg.ephemeralMessage?.message??msg.viewOnceMessage?.message??msg.viewOnceMessageV2?.message??msg.documentWithCaptionMessage?.message;if(!nested)break;msg=nested;}return {...m,message:msg};}
+app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:event'],async(q,r)=>{
  const secret=process.env.EVOLUTION_WEBHOOK_SECRET,company=process.env.EVOLUTION_COMPANY_ID,instance=process.env.EVOLUTION_INSTANCE;
- if(!secret||secret.length<32||!company||!instance||hash(q.params.secret)!==hash(secret)){r.sendStatus(404);return;}
- const event=q.body;if(event?.instance!==instance||String(event?.event).toLowerCase().replace(/_/g,'.')!=='messages.upsert'){r.json({ok:true});return;}
- const items=Array.isArray(event.data)?event.data:[event.data];
+ if(!secret||secret.length<32||!company||!instance||hash(q.params.secret)!==hash(secret)){console.warn('Evolution webhook rejected: configuration or token');r.sendStatus(404);return;}
+ const event=q.body,source=typeof event?.instance==='string'?event.instance:event?.instance?.instanceName??event?.instance?.name;
+ const type=String(event?.event??q.params.event??'').toLowerCase().replace(/[_-]/g,'.');
+ if(source!==instance||type!=='messages.upsert'){console.info('Evolution webhook ignored',{instanceMatches:source===instance,event:type.slice(0,80)});r.json({ok:true});return;}
+ const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];let imported=0,skipped=0;
  r.locals.company=company;
- await tenant(r,async c=>{for(const m of items){const key=m?.key;const jid=key?.remoteJid;if(key?.fromMe!==false||typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof key.id!=='string'||key.id.length>200)continue;
- const phone=jid.split('@')[0],media=mediaInfo(m),message=media?.text??m.message?.conversation??m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim())continue;
+ await tenant(r,async c=>{for(const item of items){const m=unwrapMessage(item),key=m?.key,phone=directPhone(key);if(key?.fromMe!==false||!phone||typeof key.id!=='string'||key.id.length>200){skipped++;continue;}
+ const media=mediaInfo(m),message=media?.text||m.message?.conversation||m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim()){skipped++;continue;}
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[company+':'+key.id]);
- await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media}),key.id]);}});
- r.json({ok:true});
+ const x=await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media}),key.id]);imported+=x.rowCount??0;
+ }});console.info('Evolution inbound processed',{received:items.length,imported,skipped});r.json({ok:true,imported,skipped});
 });
 app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at>now()',[hash(token(q))])).rows[0];if(!s){r.sendStatus(401);return;}r.locals.user=s.user_id;next();});
 app.post('/api/logout',async(q,r)=>{await pool.query('DELETE FROM sessions WHERE token_hash=$1',[hash(token(q))]);r.clearCookie('sw_session',{secure:true,httpOnly:true,sameSite:'strict',path:'/'}).json({ok:true});});
@@ -111,9 +117,9 @@ app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
  const records=Array.isArray(result)?result:result.messages?.records??result.records??result.messages;
  if(!Array.isArray(records)){r.status(502).json({error:'Unexpected Evolution response'});return;}
  let imported=0;
- await tenant(r,async c=>{for(const m of records.slice(0,100)){const k=m?.key,jid=k?.remoteJid;
- if(typeof jid!=='string'||!/^\d{8,15}@s\.whatsapp\.net$/.test(jid)||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
- const phone=jid.split('@')[0],media=mediaInfo(m),message=media?.text??m.message?.conversation??m.message?.extendedTextMessage?.text;
+ await tenant(r,async c=>{for(const item of records.slice(0,100)){const m=unwrapMessage(item),k=m?.key,phone=directPhone(k);
+ if(!phone||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
+ const media=mediaInfo(m),message=media?.text||m.message?.conversation||m.message?.extendedTextMessage?.text;
  if(typeof message!=='string'||!message.trim())continue;
  const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
