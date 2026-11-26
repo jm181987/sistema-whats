@@ -50,7 +50,7 @@ function Messaging({company,contacts,page,initialPhone,onSent}:{company:string,c
  const unread=(p:string)=>messages.filter(m=>m.data?.phone===p&&m.data?.direction==='received'&&m.created_at>(seen[p]??'')).length;
  useEffect(()=>{if(page!=='Inbox'||!phone)return;const latest=messages.find(m=>m.data?.phone===phone)?.created_at;if(latest)SEEN(old=>old[phone]===latest?old:{...old,[phone]:latest});},[phone,messages,page]);
  const peers=Array.from(new Set(messages.map(m=>m.data?.phone).filter(Boolean))) as string[];peers.sort((a,b)=>Number(pins.includes(b))-Number(pins.includes(a)));
- const label=(p:string)=>contacts.find(c=>c.phone===p)?.name??p;
+ const label=(p:string)=>{const c=contacts.find(c=>c.phone===p);return (c?.name&&c.name!==p?c.name:'')||c?.whatsapp_name||messages.find(m=>m.data?.phone===p&&m.data?.direction==='received'&&m.data?.pushName)?.data?.pushName||p;};
  const recipient=contacts.find(c=>c.phone===phone);
  const [labelDraft,LD]=useState(''),[savedLabels,SL]=useState<string[]>([]);
  useEffect(()=>{SL(recipient?.labels??[]);LD('')},[recipient?.id,JSON.stringify(recipient?.labels??[])]);

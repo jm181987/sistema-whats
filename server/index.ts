@@ -8,6 +8,7 @@ const {Pool}=pg;
 if(!process.env.DATABASE_URL) throw Error('DATABASE_URL required');
 const pool=new Pool({connectionString:process.env.DATABASE_URL});
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
+async function saveWhatsAppProfile(c:pg.PoolClient,company:string,phone:string,item:any){const name=typeof item?.pushName==='string'?item.pushName.trim().slice(0,160):'';await c.query("INSERT INTO contacts(company_id,name,phone,whatsapp_name) VALUES($1,$2,$3,$4) ON CONFLICT(company_id,phone) DO UPDATE SET whatsapp_name=CASE WHEN EXCLUDED.whatsapp_name<>'' THEN EXCLUDED.whatsapp_name ELSE contacts.whatsapp_name END WHERE EXCLUDED.whatsapp_name<>'' AND contacts.whatsapp_name IS DISTINCT FROM EXCLUDED.whatsapp_name",[company,phone,phone,name]);}
 async function initialize(){
  const c=await pool.connect();
  try{await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock(782019)');
@@ -17,6 +18,7 @@ async function initialize(){
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=1')).rowCount){await c.query(await readFile('migrations/001.sql','utf8'));await c.query('INSERT INTO schema_migrations VALUES(1)');}
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=3')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS labels text[] NOT NULL DEFAULT ARRAY[]::text[]");await c.query('INSERT INTO schema_migrations VALUES(3)');}
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=2')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN stage text NOT NULL DEFAULT 'nuevo', ADD COLUMN value numeric(14,2) NOT NULL DEFAULT 0, ADD COLUMN company_name text NOT NULL DEFAULT '', ADD COLUMN email text NOT NULL DEFAULT '', ADD COLUMN notes text NOT NULL DEFAULT ''");await c.query('INSERT INTO schema_migrations VALUES(2)');}
+ if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=4')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS whatsapp_name text NOT NULL DEFAULT ''");await c.query('INSERT INTO schema_migrations VALUES(4)');}
  const {BOOTSTRAP_EMAIL:e,BOOTSTRAP_PASSWORD:p,BOOTSTRAP_COMPANY:n}=process.env;
  if(!(await c.query('SELECT 1 FROM users LIMIT 1')).rowCount){
  if(!e||!p||p.length<14||!n)throw Error('Bootstrap email, company and password (14+ chars) required');
@@ -65,7 +67,8 @@ app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:ev
  await tenant(r,async c=>{for(const item of items){const m=unwrapMessage(item),key=m?.key,phone=directPhone(key);if(key?.fromMe!==false||!phone||typeof key.id!=='string'||key.id.length>200){skipped++;continue;}
  const media=mediaInfo(m),message=media?.text||m.message?.conversation||m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim()){skipped++;continue;}
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[company+':'+key.id]);
- const x=await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media}),key.id]);imported+=x.rowCount??0;
+ await saveWhatsAppProfile(c,company,phone,m);
+ const x=await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media,pushName:typeof m.pushName==='string'?m.pushName.slice(0,160):''}),key.id]);imported+=x.rowCount??0;
  }});console.info('Evolution inbound processed',{received:items.length,imported,skipped});r.json({ok:true,imported,skipped});
 });
 app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at>now()',[hash(token(q))])).rows[0];if(!s){r.sendStatus(401);return;}r.locals.user=s.user_id;next();});
@@ -145,7 +148,8 @@ async function syncEvolution(r:TenantContext){
  if(typeof message!=='string'||!message.trim())continue;
  const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
- const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media}),k.id,date]);imported+=x.rowCount??0;
+ if(!k.fromMe)await saveWhatsAppProfile(c,r.locals.company!,phone,m);
+ const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media,pushName:!k.fromMe&&typeof m.pushName==='string'?m.pushName.slice(0,160):''}),k.id,date]);imported+=x.rowCount??0;
  }});return {imported};
 }
 const syncInFlight=new Map<string,Promise<{imported:number}>>();
