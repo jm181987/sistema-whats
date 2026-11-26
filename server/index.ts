@@ -51,6 +51,11 @@ app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:ev
  if(!secret||secret.length<32||!company||!instance||typeof q.params.secret!=='string'||hash(q.params.secret)!==hash(secret)){console.warn('Evolution webhook rejected: configuration or token');r.sendStatus(404);return;}
  const event=q.body,source=typeof event?.instance==='string'?event.instance:event?.instance?.instanceName??event?.instance?.name;
  const type=String(event?.event??q.params.event??'').toLowerCase().replace(/[_-]/g,'.');
+ if(source===instance&&type==='messages.update'){
+ const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];r.locals.company=company;
+ await tenant(r,async c=>{for(const item of items){const id=item?.key?.id??item?.keyId??item?.id;const status=item?.update?.status??item?.status;const rank=({SERVER_ACK:1,DELIVERY_ACK:2,READ:3,PLAYED:3,'2':1,'3':2,'4':3,'5':3} as Record<string,number>)[String(status).toUpperCase()];if(typeof id!=='string'||id.length>200||!rank)continue;
+ await c.query("UPDATE conversations SET data=jsonb_set(data,'{deliveryRank}',to_jsonb($2::int),true) WHERE data->>'providerId'=$1 AND data->>'direction'='sent' AND COALESCE((data->>'deliveryRank')::int,0)<$2",[id,rank]);}});r.json({ok:true});return;
+ }
  if(source!==instance||type!=='messages.upsert'){console.info('Evolution webhook ignored',{instanceMatches:source===instance,event:type.slice(0,80)});r.json({ok:true});return;}
  const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];let imported=0,skipped=0;
  r.locals.company=company;
