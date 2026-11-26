@@ -64,7 +64,8 @@ app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM 
 app.post('/api/logout',async(q,r)=>{await pool.query('DELETE FROM sessions WHERE token_hash=$1',[hash(token(q))]);r.clearCookie('sw_session',{secure:true,httpOnly:true,sameSite:'strict',path:'/'}).json({ok:true});});
 app.get('/api/companies',async(_q,r)=>{r.json((await pool.query('SELECT c.id,c.name,m.role FROM companies c JOIN memberships m ON m.company_id=c.id WHERE m.user_id=$1',[r.locals.user])).rows);});
 app.use('/api/tenant/:company',async(q,r,next)=>{const id=q.params.company;if(!/^[0-9a-f-]{36}$/i.test(id)){r.sendStatus(400);return;}const m=(await pool.query('SELECT role FROM memberships WHERE company_id=$1 AND user_id=$2',[id,r.locals.user])).rows[0];if(!m){r.sendStatus(403);return;}r.locals.company=id;r.locals.role=m.role;next();});
-async function tenant(r:express.Response,fn:(c:pg.PoolClient)=>Promise<unknown>){const c=await pool.connect();try{await c.query('BEGIN');await c.query("SELECT set_config('app.company_id',$1,true)",[r.locals.company]);const result=await fn(c);await c.query('COMMIT');return result;}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}}
+type TenantContext={locals:{company?:string;[key:string]:any}};
+async function tenant(r:TenantContext,fn:(c:pg.PoolClient)=>Promise<unknown>){const c=await pool.connect();try{await c.query('BEGIN');await c.query("SELECT set_config('app.company_id',$1,true)",[r.locals.company]);const result=await fn(c);await c.query('COMMIT');return result;}catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}}
 app.get('/api/tenant/:company/contacts',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query('SELECT * FROM contacts ORDER BY created_at DESC LIMIT 500')).rows)));
 app.post('/api/tenant/:company/contacts',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {name,phone}=q.body??{};if(typeof name!=='string'||!name.trim()||name.length>200||typeof phone!=='string'||!/^\+?[1-9]\d{7,14}$/.test(phone)){r.sendStatus(400);return;}r.status(201).json(await tenant(r,async c=>(await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) RETURNING *',[r.locals.company,name.trim(),phone.replace(/^\+/,'')])).rows[0]));});
 app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
@@ -84,7 +85,7 @@ app.get('/api/tenant/:company/activity',async(_q,r)=>{
 });
 app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes,name}=q.body??{};if(name!==undefined&&(typeof name!=='string'||!name.trim()||name.length>200)){r.sendStatus(400);return;}if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5,name=COALESCE($7,name) WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id,name?.trim()??null])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
-async function evolution(r:express.Response,path:string,body?:unknown,method?:string){
+async function evolution(r:TenantContext,path:string,body?:unknown,method?:string){
  const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
  if(!base||!key||!instance||company!==r.locals.company)throw Error('Revisá EVOLUTION_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE y EVOLUTION_COMPANY_ID');
  const endpoint=new URL(base.trim());
@@ -112,11 +113,10 @@ app.post('/api/tenant/:company/whatsapp/disconnect',rateLimit({windowMs:60000,li
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
  try{await evolution(r,'/instance/logout',undefined,'DELETE');r.json({ok:true});}catch{r.status(502).json({error:'No se pudo desvincular WhatsApp'});}
 });
-app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
- if(r.locals.role==='viewer'){r.sendStatus(403);return;}
+async function syncEvolution(r:TenantContext){
  const result=await evolution(r,'/chat/findMessages',{where:{},page:1,offset:100});
  const records=Array.isArray(result)?result:result.messages?.records??result.records??result.messages;
- if(!Array.isArray(records)){r.status(502).json({error:'Unexpected Evolution response'});return;}
+ if(!Array.isArray(records))throw Error('Unexpected Evolution response');
  let imported=0;
  await tenant(r,async c=>{for(const item of records.slice(0,100)){const m=unwrapMessage(item),k=m?.key,phone=directPhone(k);
  if(!phone||typeof k.id!=='string'||k.id.length>200||typeof k.fromMe!=='boolean')continue;
@@ -125,8 +125,11 @@ app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
  const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
  const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media}),k.id,date]);imported+=x.rowCount??0;
- }});r.json({imported});
-});
+ }});return {imported};
+}
+let syncInFlight:Promise<{imported:number}>|null=null;
+function sharedSync(company:string){if(company!==process.env.EVOLUTION_COMPANY_ID)return Promise.reject(Error('Evolution not configured for company'));if(!syncInFlight){syncInFlight=syncEvolution({locals:{company}}).finally(()=>{syncInFlight=null});}return syncInFlight;}
+app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}r.json(await sharedSync(r.locals.company));});
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data - 'mediaBase64' AS data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.get('/api/tenant/:company/whatsapp/media/:id',async(q,r)=>{
  const row:any=await tenant(r,async c=>(await c.query('SELECT data FROM conversations WHERE id=$1',[q.params.id])).rows[0]);const d=row?.data;if(!d?.media){r.sendStatus(404);return;}
@@ -169,3 +172,6 @@ app.use('/api',(_q,r)=>r.sendStatus(404));
 app.use(express.static('dist/web'));app.get('/',(_q,r)=>r.sendFile('index.html',{root:'dist/web'}));
 app.use((e:any,_q:express.Request,r:express.Response,_n:express.NextFunction)=>{console.error('Request failed',e.code??'internal');r.status(e.code==='23505'?409:500).json({error:'Request failed'});});
 app.listen(Number(process.env.PORT??3000),'0.0.0.0');
+async function automaticSync(){const company=process.env.EVOLUTION_COMPANY_ID;if(!company||!process.env.EVOLUTION_URL||!process.env.EVOLUTION_API_KEY||!process.env.EVOLUTION_INSTANCE)return;try{const x=await sharedSync(company);if(x.imported)console.info('Evolution automatic sync',{imported:x.imported});}catch(e){console.warn('Evolution automatic sync failed',e instanceof Error&&/^Evolution respondió HTTP \\d{3}$/.test(e.message)?e.message:'provider or database unavailable');}finally{setTimeout(automaticSync,5000).unref();}}
+if(process.env.EVOLUTION_COMPANY_ID){console.info('Evolution automatic sync enabled (5s after each cycle)');void automaticSync();}
+
