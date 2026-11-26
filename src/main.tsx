@@ -51,7 +51,6 @@ function Messaging({company,contacts,page,initialPhone,onSent}:{company:string,c
  const peers=Array.from(new Set(messages.map(m=>m.data?.phone).filter(Boolean))) as string[];peers.sort((a,b)=>Number(pins.includes(b))-Number(pins.includes(a)));
  const label=(p:string)=>contacts.find(c=>c.phone===p)?.name??p;
  const recipient=contacts.find(c=>c.phone===phone);
- const direct=page==='Enviar'&&manual;
  const [labelDraft,LD]=useState(''),[savedLabels,SL]=useState<string[]>([]);
  useEffect(()=>{SL(recipient?.labels??[]);LD('')},[recipient?.id,JSON.stringify(recipient?.labels??[])]);
  async function saveLabels(next:string[]){if(!recipient)return;try{const x=await api('tenant/'+company+'/contacts/'+recipient.id+'/labels',{labels:next});SL(x.labels);LD('');onSent();}catch(e:any){E(e.message)}}
