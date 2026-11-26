@@ -8,7 +8,7 @@ function Messaging({company,contacts,page,initialPhone,onSent}:{company:string,c
  const base='tenant/'+company+'/whatsapp/'; const [config,K]=useState<any>({});
  async function refresh(){try{const [x,y,z]=await Promise.all([api(base+'status'),api(base+'messages'),api(base+'config')]);U(x.state);M(y);K(z);E('');}catch(e:any){E(e.message);}}
  useEffect(()=>{refresh();},[company]);
- useEffect(()=>{if(page!=='Inbox')return;let active=true;const timer=setInterval(()=>api(base+'messages').then(x=>{if(active)M(x)}).catch(()=>{}),10000);return()=>{active=false;clearInterval(timer)}},[company,page]);
+ useEffect(()=>{if(page!=='Inbox')return;let active=true;const timer=setInterval(()=>api(base+'messages').then(x=>{if(active)M(x)}).catch(()=>{}),3000);return()=>{active=false;clearInterval(timer)}},[company,page]);
  const [qr,QR]=useState(''),[qrOpen,QO]=useState(false),[qrBusy,QB]=useState(false),[qrError,QE]=useState('');
  async function connect(){QB(true);QE('');QR('');try{const x=await api(base+'connect',{});U(x.state);if(x.state==='open'){QO(false);E('WhatsApp ya está conectado.');return;}QR(x.qr??(x.code?await QRCode.toDataURL(x.code,{width:320,margin:4}):''));}catch(e:any){QE(e.message);}finally{QB(false);}}
  useEffect(()=>{if(!qrOpen)return;let active=true;const timer=setInterval(async()=>{try{const x=await api(base+'status');if(active){U(x.state);if(x.state==='open'){QR('');QO(false);}}}catch{}},3000);return()=>{active=false;clearInterval(timer)}},[qrOpen,company]);
