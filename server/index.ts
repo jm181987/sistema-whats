@@ -49,9 +49,10 @@ function directPhone(key:any):string|null{
 }
 function unwrapMessage(m:any){let msg=m?.message??{};for(let i=0;i<5;i++){const nested=msg.ephemeralMessage?.message??msg.viewOnceMessage?.message??msg.viewOnceMessageV2?.message??msg.documentWithCaptionMessage?.message;if(!nested)break;msg=nested;}return {...m,message:msg};}
 app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:event'],async(q,r)=>{
- const secret=process.env.EVOLUTION_WEBHOOK_SECRET,company=process.env.EVOLUTION_COMPANY_ID,instance=process.env.EVOLUTION_INSTANCE;
- if(!secret||secret.length<32||!company||!instance||typeof q.params.secret!=='string'||hash(q.params.secret)!==hash(secret)){console.warn('Evolution webhook rejected: configuration or token');r.sendStatus(404);return;}
+ const secret=process.env.EVOLUTION_WEBHOOK_SECRET;
+ if(!secret||secret.length<32||typeof q.params.secret!=='string'||hash(q.params.secret)!==hash(secret)){console.warn('Evolution webhook rejected: configuration or token');r.sendStatus(404);return;}
  const event=q.body,source=typeof event?.instance==='string'?event.instance:event?.instance?.instanceName??event?.instance?.name;
+ const company=typeof source==='string'&&/^sw-[0-9a-f-]{36}$/.test(source)?source.slice(3):'';if(!company||!await configuredInstance(company)){r.json({ok:true});return;}const instance=instanceName(company);
  const type=String(event?.event??q.params.event??'').toLowerCase().replace(/[_-]/g,'.');
  if(source===instance&&type==='messages.update'){
  const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];r.locals.company=company;
@@ -93,16 +94,28 @@ app.get('/api/tenant/:company/activity',async(_q,r)=>{
 app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes,name}=q.body??{};if(name!==undefined&&(typeof name!=='string'||!name.trim()||name.length>200)){r.sendStatus(400);return;}if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5,name=COALESCE($7,name) WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id,name?.trim()??null])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
 app.post('/api/tenant/:company/contacts/:id/labels',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const labels=q.body?.labels;if(!Array.isArray(labels)||labels.length>20||!labels.every(x=>typeof x==='string'&&x.trim().length>0&&x.trim().length<=40)){r.sendStatus(400);return;}const clean=[...new Set(labels.map(x=>x.trim()))];const row=await tenant(r,async c=>(await c.query('UPDATE contacts SET labels=$1 WHERE id=$2 RETURNING labels',[clean,q.params.id])).rows[0]);if(!row){r.sendStatus(404);return;}r.json(row);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
-async function evolution(r:TenantContext,path:string,body?:unknown,method?:string){
- const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
- if(!base||!key||!instance||company!==r.locals.company)throw Error('Revisá EVOLUTION_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE y EVOLUTION_COMPANY_ID');
+async function evolutionGlobal(path:string,body?:unknown,method?:string){
+ const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key}=process.env;
+ if(!base||!key)throw Error('Revisá EVOLUTION_URL y EVOLUTION_API_KEY global');
  const endpoint=new URL(base.trim());
  if(endpoint.username||endpoint.password||endpoint.search||endpoint.hash)throw Error('EVOLUTION_URL debe ser una URL base sin credenciales ni parámetros');
  if(endpoint.protocol!=='https:'&&!(endpoint.origin==='http://167.86.122.123:8080'&&endpoint.pathname==='/'))throw Error('EVOLUTION_URL debe usar HTTPS o el servidor HTTP autorizado 167.86.122.123:8080');
- const response=await fetch(endpoint.href.replace(/\/$/,'')+path+'/'+encodeURIComponent(instance),{method:method??(body===undefined?'GET':'POST'),headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
+ const response=await fetch(endpoint.href.replace(/\/$/,'')+path,{method:method??(body===undefined?'GET':'POST'),headers:{apikey:key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(15000)});
  if(!response.ok)throw Error('Evolution respondió HTTP '+response.status);return response.json();
 }
-app.get('/api/tenant/:company/whatsapp/config',(_q,r)=>{const configured=process.env.EVOLUTION_COMPANY_ID===r.locals.company;r.json({url:configured?process.env.EVOLUTION_URL??'':'',instance:configured?process.env.EVOLUTION_INSTANCE??'':'',keyConfigured:configured&&!!process.env.EVOLUTION_API_KEY});});
+
+function instanceName(company:string){return 'sw-'+company.toLowerCase();}
+async function configuredInstance(company:string){return !!(await tenant({locals:{company}},async c=>(await c.query("SELECT id FROM connections WHERE data->>'kind'='evolution' LIMIT 1")).rows[0]));}
+async function evolution(r:TenantContext,path:string,body?:unknown,method?:string){const company=r.locals.company;if(!company||!await configuredInstance(company))throw Error('Creá una instancia de WhatsApp primero');return evolutionGlobal(path+'/'+encodeURIComponent(instanceName(company)),body,method);}
+app.get('/api/tenant/:company/whatsapp/config',async(_q,r)=>{const configured=await configuredInstance(r.locals.company);r.json({url:process.env.EVOLUTION_URL??'',instance:configured?instanceName(r.locals.company):'',keyConfigured:!!process.env.EVOLUTION_API_KEY});});
+app.post('/api/tenant/:company/whatsapp/create-instance',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
+ if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ const company=r.locals.company,name=instanceName(company),secret=process.env.EVOLUTION_WEBHOOK_SECRET,base=process.env.PUBLIC_APP_URL;
+ if(!secret||secret.length<32||!base||!base.startsWith('https://')){r.status(400).json({error:'Configurá PUBLIC_APP_URL HTTPS y EVOLUTION_WEBHOOK_SECRET'});return;}
+ try{await tenant(r,async c=>{await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[name]);const exists=(await c.query("SELECT id FROM connections WHERE data->>'kind'='evolution'")).rowCount;if(!exists){await evolutionGlobal('/instance/create',{instanceName:name,integration:'WHATSAPP-BAILEYS',qrcode:true});await c.query('INSERT INTO connections(company_id,title,data) VALUES($1,$2,$3)',[company,name,JSON.stringify({kind:'evolution'})]);}});
+ await evolution(r,'/webhook/set',{webhook:{enabled:true,url:base.replace(/\/$/,'')+'/api/webhooks/evolution/'+encodeURIComponent(secret),byEvents:false,base64:false,events:['MESSAGES_UPSERT','MESSAGES_UPDATE','CONNECTION_UPDATE']}});r.json({ok:true,instance:name});
+ }catch(e){r.status(502).json({error:e instanceof Error?e.message:'No se pudo crear la instancia'});}
+});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
 app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
@@ -135,8 +148,8 @@ async function syncEvolution(r:TenantContext){
  const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media}),k.id,date]);imported+=x.rowCount??0;
  }});return {imported};
 }
-let syncInFlight:Promise<{imported:number}>|null=null;
-function sharedSync(company:string){if(company!==process.env.EVOLUTION_COMPANY_ID)return Promise.reject(Error('Evolution not configured for company'));if(!syncInFlight){syncInFlight=syncEvolution({locals:{company}}).finally(()=>{syncInFlight=null});}return syncInFlight;}
+const syncInFlight=new Map<string,Promise<{imported:number}>>();
+function sharedSync(company:string){let p=syncInFlight.get(company);if(!p){p=syncEvolution({locals:{company}}).finally(()=>{syncInFlight.delete(company)});syncInFlight.set(company,p);}return p;}
 app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}r.json(await sharedSync(r.locals.company));});
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data - 'mediaBase64' AS data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.get('/api/tenant/:company/whatsapp/media/:id',async(q,r)=>{
@@ -158,7 +171,7 @@ app.get('/api/tenant/:company/whatsapp/queue',async(_q,r)=>r.json(await tenant(r
 app.post('/api/tenant/:company/whatsapp/queue',rateLimit({windowMs:60000,limit:20}),async(q,r)=>{
  if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text,requestId}=q.body??{};
  if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000||typeof requestId!=='string'||! /^[0-9a-f-]{36}$/i.test(requestId)){r.sendStatus(400);return;}
- if(r.locals.company!==process.env.EVOLUTION_COMPANY_ID){r.status(400).json({error:'Evolution no configurado'});return;}
+ if(!await configuredInstance(r.locals.company)){r.status(400).json({error:'Evolution no configurado'});return;}
  const row=await tenant(r,async c=>{await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':queue:'+requestId]);const old=(await c.query("SELECT id FROM automations WHERE data->>'kind'='outbound_text' AND data->>'requestId'=$1",[requestId])).rows[0];if(old)return old;
  return (await c.query("INSERT INTO automations(company_id,title,data) VALUES($1,$2,$3) RETURNING id",[r.locals.company,phone,JSON.stringify({kind:'outbound_text',requestId,phone,text,state:'pending'})])).rows[0];});r.status(202).json(row);
 });
@@ -189,12 +202,11 @@ app.use('/api',(_q,r)=>r.sendStatus(404));
 app.use(express.static('dist/web'));app.get('/',(_q,r)=>r.sendFile('index.html',{root:'dist/web'}));
 app.use((e:any,_q:express.Request,r:express.Response,_n:express.NextFunction)=>{console.error('Request failed',e.code??'internal');r.status(e.code==='23505'?409:500).json({error:'Request failed'});});
 app.listen(Number(process.env.PORT??3000),'0.0.0.0');
-async function automaticSync(){const company=process.env.EVOLUTION_COMPANY_ID;if(!company||!process.env.EVOLUTION_URL||!process.env.EVOLUTION_API_KEY||!process.env.EVOLUTION_INSTANCE)return;try{const x=await sharedSync(company);if(x.imported)console.info('Evolution automatic sync',{imported:x.imported});}catch(e){console.warn('Evolution automatic sync failed',e instanceof Error&&/^Evolution respondió HTTP \\d{3}$/.test(e.message)?e.message:'provider or database unavailable');}finally{setTimeout(automaticSync,5000).unref();}}
-if(process.env.EVOLUTION_COMPANY_ID){console.info('Evolution automatic sync enabled (5s after each cycle)');void automaticSync();}
-
-
-async function outboundWorker(){const company=process.env.EVOLUTION_COMPANY_ID;if(!company)return;const ctx={locals:{company}};try{
+async function activeCompanies(){const rows=(await pool.query('SELECT id FROM companies')).rows;const ids:string[]=[];for(const row of rows)if(await configuredInstance(row.id))ids.push(row.id);return ids;}
+async function automaticSync(){try{for(const company of await activeCompanies()){try{await sharedSync(company);}catch{console.warn('Evolution automatic sync failed');}}}catch{console.warn('Evolution sync scan failed');}finally{setTimeout(automaticSync,5000).unref();}}
+void automaticSync();
+async function outboundWorker(){try{for(const company of await activeCompanies()){const ctx={locals:{company}};
  const job:any=await tenant(ctx,async c=>(await c.query("UPDATE automations SET data=data || jsonb_build_object('state','processing','startedAt',now()) WHERE id=(SELECT id FROM automations WHERE data->>'kind'='outbound_text' AND data->>'state'='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,data")).rows[0]);
  if(job){let state='uncertain',error='Envío sin confirmar; revisar historial antes de reenviar';try{const allowed=await tenant(ctx,async c=>!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND opted_out',[job.data.phone])).rowCount);if(!allowed){state='failed';error='Destinatario excluido';}else{const result=await evolution(ctx,'/message/sendText',{number:job.data.phone,text:job.data.text});await tenant(ctx,async c=>{await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$2) ON CONFLICT(company_id,phone) DO NOTHING',[company,job.data.phone]);await c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[company,job.data.phone,JSON.stringify({phone:job.data.phone,text:job.data.text,direction:'sent',providerId:result.key?.id})]);await c.query("UPDATE automations SET data=data || jsonb_build_object('state','sent','finishedAt',now()) WHERE id=$1",[job.id]);});state='sent';}}catch{}if(state!=='sent')await tenant(ctx,async c=>c.query("UPDATE automations SET data=data || jsonb_build_object('state',$2::text,'error',$3::text,'finishedAt',now()) WHERE id=$1",[job.id,state,error]));}
- }catch{console.warn('Outbound queue worker failed');}finally{setTimeout(outboundWorker,3000).unref();}}
-if(process.env.EVOLUTION_COMPANY_ID)void outboundWorker();
+ }}catch{console.warn('Outbound queue worker failed');}finally{setTimeout(outboundWorker,3000).unref();}}
+void outboundWorker();
