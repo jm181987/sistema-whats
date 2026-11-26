@@ -8,7 +8,8 @@ const {Pool}=pg;
 if(!process.env.DATABASE_URL) throw Error('DATABASE_URL required');
 const pool=new Pool({connectionString:process.env.DATABASE_URL});
 const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
-async function saveWhatsAppProfile(c:pg.PoolClient,company:string,phone:string,item:any){const name=typeof item?.pushName==='string'?item.pushName.trim().slice(0,160):'';await c.query("INSERT INTO contacts(company_id,name,phone,whatsapp_name) VALUES($1,$2,$3,$4) ON CONFLICT(company_id,phone) DO UPDATE SET whatsapp_name=CASE WHEN EXCLUDED.whatsapp_name<>'' THEN EXCLUDED.whatsapp_name ELSE contacts.whatsapp_name END WHERE EXCLUDED.whatsapp_name<>'' AND contacts.whatsapp_name IS DISTINCT FROM EXCLUDED.whatsapp_name",[company,phone,phone,name]);}
+function profileName(item:any){for(const v of [item?.pushName,item?.pushname,item?.notify,item?.verifiedName,item?.name,item?.contact?.pushName,item?.contact?.name])if(typeof v==='string'&&v.trim()&&!/^\+?[\d\s()-]+$/.test(v.trim()))return v.trim().slice(0,160);return '';}
+async function saveWhatsAppProfile(c:pg.PoolClient,company:string,phone:string,item:any){const name=profileName(item);await c.query("INSERT INTO contacts(company_id,name,phone,whatsapp_name) VALUES($1,$2,$3,$4) ON CONFLICT(company_id,phone) DO UPDATE SET whatsapp_name=CASE WHEN EXCLUDED.whatsapp_name<>'' THEN EXCLUDED.whatsapp_name ELSE contacts.whatsapp_name END WHERE EXCLUDED.whatsapp_name<>'' AND contacts.whatsapp_name IS DISTINCT FROM EXCLUDED.whatsapp_name",[company,phone,phone,name]);}
 async function initialize(){
  const c=await pool.connect();
  try{await c.query('BEGIN');await c.query('SELECT pg_advisory_xact_lock(782019)');
@@ -68,7 +69,7 @@ app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:ev
  const media=mediaInfo(m),message=media?.text||m.message?.conversation||m.message?.extendedTextMessage?.text;if(typeof message!=='string'||!message.trim()){skipped++;continue;}
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[company+':'+key.id]);
  await saveWhatsAppProfile(c,company,phone,m);
- const x=await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media,pushName:typeof m.pushName==='string'?m.pushName.slice(0,160):''}),key.id]);imported+=x.rowCount??0;
+ const x=await c.query("INSERT INTO conversations(company_id,title,data) SELECT $1,$2,$3::jsonb WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:'received',providerId:key.id,media,pushName:profileName(m)}),key.id]);imported+=x.rowCount??0;
  }});console.info('Evolution inbound processed',{received:items.length,imported,skipped});r.json({ok:true,imported,skipped});
 });
 app.use('/api',async(q,r,next)=>{const s=(await pool.query('SELECT user_id FROM sessions WHERE token_hash=$1 AND expires_at>now()',[hash(token(q))])).rows[0];if(!s){r.sendStatus(401);return;}r.locals.user=s.user_id;next();});
@@ -155,13 +156,19 @@ async function syncEvolution(r:TenantContext){
  const ts=Number(m.messageTimestamp),date=Number.isFinite(ts)&&ts>0&&ts<4102444800?new Date(ts*1000):new Date();
  await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':'+k.id]);
  if(!k.fromMe)await saveWhatsAppProfile(c,r.locals.company!,phone,m);
- const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media,pushName:!k.fromMe&&typeof m.pushName==='string'?m.pushName.slice(0,160):''}),k.id,date]);imported+=x.rowCount??0;
+ const x=await c.query("INSERT INTO conversations(company_id,title,data,created_at) SELECT $1,$2,$3::jsonb,$5 WHERE NOT EXISTS(SELECT 1 FROM conversations WHERE data->>'providerId'=$4)",[r.locals.company,phone,JSON.stringify({phone,text:message.slice(0,16000),direction:k.fromMe?'sent':'received',providerId:k.id,media,pushName:!k.fromMe?profileName(m):''}),k.id,date]);imported+=x.rowCount??0;
  }});return {imported};
 }
 const syncInFlight=new Map<string,Promise<{imported:number}>>();
 function sharedSync(company:string){let p=syncInFlight.get(company);if(!p){p=syncEvolution({locals:{company}}).finally(()=>{syncInFlight.delete(company)});syncInFlight.set(company,p);}return p;}
 app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}r.json(await sharedSync(r.locals.company));});
-app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data - 'mediaBase64' AS data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
+app.post('/api/tenant/:company/whatsapp/sync-names',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
+ if(r.locals.role==='viewer'){r.sendStatus(403);return;}
+ try{const result=await evolution(r,'/chat/findContacts',{});const rows=Array.isArray(result)?result:result?.contacts?.records??result?.contacts??result?.records;if(!Array.isArray(rows))throw Error('Formato de contactos no reconocido');let updated=0;
+ await tenant(r,async c=>{for(const item of rows.slice(0,5000)){const phone=directPhone({remoteJid:item.remoteJid??item.id,remoteJidAlt:item.remoteJidAlt});const name=profileName(item);if(!phone||!name)continue;await saveWhatsAppProfile(c,r.locals.company,phone,item);updated++;}});r.json({updated});
+ }catch(e){r.status(502).json({error:e instanceof Error?e.message:'No se pudieron sincronizar nombres'});}
+});
+app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT v.id,v.title,(v.data - 'mediaBase64') || jsonb_build_object('contactName',COALESCE(NULLIF(CASE WHEN c.name<>c.phone THEN c.name END,''),NULLIF(c.whatsapp_name,''),NULLIF(v.data->>'pushName',''),v.data->>'phone')) AS data,v.created_at FROM conversations v LEFT JOIN contacts c ON c.company_id=v.company_id AND c.phone=v.data->>'phone' ORDER BY v.created_at DESC LIMIT 500")).rows)));
 app.get('/api/tenant/:company/whatsapp/media/:id',async(q,r)=>{
  const row:any=await tenant(r,async c=>(await c.query('SELECT data FROM conversations WHERE id=$1',[q.params.id])).rows[0]);const d=row?.data;if(!d?.media){r.sendStatus(404);return;}
  let b64=d.mediaBase64,mime=d.media.mime;
