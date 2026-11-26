@@ -119,6 +119,12 @@ app.post('/api/tenant/:company/whatsapp/create-instance',rateLimit({windowMs:600
  await evolution(r,'/webhook/set',{webhook:{enabled:true,url:base.replace(/\/$/,'')+'/api/webhooks/evolution/'+encodeURIComponent(secret),byEvents:false,base64:false,events:['MESSAGES_UPSERT','MESSAGES_UPDATE','CONNECTION_UPDATE']}});r.json({ok:true,instance:name});
  }catch(e){r.status(502).json({error:e instanceof Error?e.message:'No se pudo crear la instancia'});}
 });
+app.get('/api/tenant/:company/whatsapp/profile-photo/:phone',rateLimit({windowMs:60000,limit:60}),async(q,r)=>{
+ const phone=String(q.params.phone);if(!/^\d{8,15}$/.test(phone)){r.sendStatus(400);return;}
+ const known=await tenant(r,async c=>!!(await c.query("SELECT 1 FROM contacts WHERE phone=$1 UNION ALL SELECT 1 FROM conversations WHERE data->>'phone'=$1 LIMIT 1",[phone])).rowCount);
+ if(!known){r.sendStatus(404);return;}
+ try{const x=await evolution(r,'/chat/fetchProfilePictureUrl',{number:phone});const raw=x?.profilePictureUrl??x?.picture??x?.url;let url='';if(typeof raw==='string'){const u=new URL(raw);if(u.protocol==='https:'&&!u.username&&!u.password&&(u.hostname==='whatsapp.net'||u.hostname.endsWith('.whatsapp.net')))url=u.href;}r.json({url});}catch{r.json({url:''});}
+});
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
 app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
