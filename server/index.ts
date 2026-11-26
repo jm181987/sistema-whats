@@ -67,7 +67,10 @@ app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
  }});r.json({added,skipped});
 });
 app.get('/api/tenant/:company/contacts/export',async(_q,r)=>{r.json({leads:await tenant(r,async c=>(await c.query('SELECT name,phone,stage,value,company_name AS company,email,notes,created_at AS "createdAt" FROM contacts ORDER BY created_at')).rows),exportDate:new Date().toISOString()});});
-app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes}=q.body??{};if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5 WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
+app.get('/api/tenant/:company/activity',async(_q,r)=>{
+ const rows=await tenant(r,async c=>(await c.query("SELECT data->>'phone' AS phone,max(created_at) AS last_contact,count(*) FILTER (WHERE data->>'direction'='received')::int AS received,count(*) FILTER (WHERE data->>'direction'='sent')::int AS sent FROM conversations WHERE data->>'phone' IS NOT NULL GROUP BY data->>'phone'")).rows);r.json(rows);
+});
+app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes,name}=q.body??{};if(name!==undefined&&(typeof name!=='string'||!name.trim()||name.length>200)){r.sendStatus(400);return;}if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5,name=COALESCE($7,name) WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id,name?.trim()??null])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
 async function evolution(r:express.Response,path:string,body?:unknown,method?:string){
  const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
@@ -114,7 +117,14 @@ app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
 });
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
- const allowed=await tenant(r,async c=>(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount);if(!allowed){r.status(403).json({error:'Contact consent required'});return;}
+ const allowed=await tenant(r,async c=>{
+ const existing=(await c.query('SELECT consent_at,opted_out FROM contacts WHERE phone=$1',[phone])).rows[0];
+ if(existing?.opted_out)return false;
+ if(existing?.consent_at)return true;
+ if(q.body.manual!==true||q.body.authorized!==true)return false;
+ await c.query('INSERT INTO contacts(company_id,name,phone,consent_at) VALUES($1,$2,$3,now()) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);
+ return !!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount;
+ });if(!allowed){r.status(403).json({error:'El destinatario no tiene autorización registrada o ha solicitado no recibir mensajes.'});return;}
  const result=await evolution(r,'/message/sendText',{number:phone,text});await tenant(r,async c=>c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[r.locals.company,phone,JSON.stringify({phone,text,direction:'sent',providerId:result.key?.id})]));r.json({ok:true});});
 app.post('/api/tenant/:company/contacts/:id/consent',async(q,r)=>{if(!['owner','admin'].includes(r.locals.role)||typeof q.body?.consent!=='boolean'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('UPDATE contacts SET consent_at=CASE WHEN $1 THEN now() ELSE NULL END,opted_out=NOT $1 WHERE id=$2',[q.body.consent,q.params.id]));r.json({ok:true});});
 app.use('/api',(_q,r)=>r.sendStatus(404));
