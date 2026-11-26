@@ -37,10 +37,11 @@ app.post('/api/login',rateLimit({windowMs:900000,limit:15}),async(q,r)=>{
 });
 function token(q:express.Request){return (q.headers.cookie??'').match(/(?:^|;\s*)sw_session=([a-f0-9]{64})(?:;|$)/)?.[1]??'';}
 function mediaInfo(m:any){
- const msg=m?.message??{};for(const kind of ['image','video','audio']){const item=msg[kind+'Message'];if(item)return {kind,text:typeof item.caption==='string'?item.caption:'['+kind+']',mime:typeof item.mimetype==='string'?item.mimetype.split(';')[0]:'',ptt:kind==='audio'&&item.ptt===true};}return null;
+ const msg=m?.message??{};for(const kind of ['image','video','audio','document']){const item=msg[kind+'Message'];if(item)return {kind,text:typeof item.caption==='string'?item.caption:'['+kind+']',mime:typeof item.mimetype==='string'?item.mimetype.split(';')[0]:'',ptt:kind==='audio'&&item.ptt===true};}return null;
 }
-const mediaTypes:Record<string,string[]>={image:['image/jpeg','image/png','image/webp'],video:['video/mp4','video/webm'],audio:['audio/ogg','audio/mpeg','audio/mp4','audio/wav','audio/webm','audio/aac']};
-function validMedia(kind:string,mime:string,b64:string){return !!mediaTypes[kind]?.includes(mime)&&typeof b64==='string'&&b64.length>0&&b64.length<=22369624&&/^[A-Za-z0-9+/]+={0,2}$/.test(b64)&&Buffer.from(b64,'base64').length<=16777216;}
+const mediaTypes:Record<string,string[]>={image:['image/jpeg','image/png','image/webp'],video:['video/mp4','video/webm'],document:['application/pdf'],audio:['audio/ogg','audio/mpeg','audio/mp4','audio/wav','audio/webm','audio/aac']};
+function kindDisposition(kind:string){return kind==='document'?'inline; filename="documento.pdf"':'inline';}
+function validMedia(kind:string,mime:string,b64:string){return !!mediaTypes[kind]?.includes(mime)&&typeof b64==='string'&&b64.length>0&&b64.length<=22369624&&/^[A-Za-z0-9+/]+={0,2}$/.test(b64)&&Buffer.from(b64,'base64').length<=16777216&&(kind!=='document'||Buffer.from(b64.slice(0,12),'base64').subarray(0,5).toString()==='%PDF-');}
 function directPhone(key:any):string|null{
  if(typeof key?.remoteJid==='string'&&!/@(?:s\.whatsapp\.net|lid)$/.test(key.remoteJid))return null;
  for(const jid of [key?.remoteJidAlt,key?.remoteJid,key?.senderPn,key?.participantAlt]){if(typeof jid==='string'&&/^\d{8,15}(?::\d+)?@s\.whatsapp\.net$/.test(jid))return jid.split('@')[0].split(':')[0];}return null;
@@ -142,7 +143,7 @@ app.get('/api/tenant/:company/whatsapp/media/:id',async(q,r)=>{
  if(!b64){const x=await evolution(r,'/chat/getBase64FromMediaMessage',{message:{key:{id:d.providerId}},convertToMp4:false});b64=x.base64;mime=(x.mimetype??mime).split(';')[0];}
  if(typeof b64==='string'&&b64.startsWith('data:'))b64=b64.split(',')[1];
  if(!validMedia(d.media.kind,mime,b64)){r.status(415).json({error:'Formato multimedia no compatible'});return;}
- const bytes=Buffer.from(b64,'base64');r.set({'Content-Type':mime,'X-Content-Type-Options':'nosniff','Content-Disposition':'inline','Accept-Ranges':'bytes'});const range=q.headers.range?.match(/^bytes=(\d+)-(\d*)$/);if(range){const start=Number(range[1]),end=range[2]?Math.min(Number(range[2]),bytes.length-1):bytes.length-1;if(start>end||start>=bytes.length){r.set('Content-Range','bytes */'+bytes.length).sendStatus(416);return;}r.status(206).set('Content-Range','bytes '+start+'-'+end+'/'+bytes.length).send(bytes.subarray(start,end+1));return;}r.send(bytes);
+ const bytes=Buffer.from(b64,'base64');r.set({'Content-Type':mime,'X-Content-Type-Options':'nosniff','Content-Disposition':kindDisposition(d.media.kind),'Content-Security-Policy':"sandbox; default-src 'none'",'Accept-Ranges':'bytes'});const range=q.headers.range?.match(/^bytes=(\d+)-(\d*)$/);if(range){const start=Number(range[1]),end=range[2]?Math.min(Number(range[2]),bytes.length-1):bytes.length-1;if(start>end||start>=bytes.length){r.set('Content-Range','bytes */'+bytes.length).sendStatus(416);return;}r.status(206).set('Content-Range','bytes '+start+'-'+end+'/'+bytes.length).send(bytes.subarray(start,end+1));return;}r.send(bytes);
 });
 app.post('/api/tenant/:company/whatsapp/send-media',rateLimit({windowMs:60000,limit:20}),async(q,r)=>{
  if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,kind,mime,base64,caption='',ptt=false}=q.body??{};
