@@ -15,6 +15,7 @@ async function initialize(){
  if(role.rows[0].rolsuper||role.rows[0].rolbypassrls) throw Error('Unsafe database role');
  await c.query('CREATE TABLE IF NOT EXISTS schema_migrations(version integer PRIMARY KEY)');
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=1')).rowCount){await c.query(await readFile('migrations/001.sql','utf8'));await c.query('INSERT INTO schema_migrations VALUES(1)');}
+ if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=3')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS labels text[] NOT NULL DEFAULT ARRAY[]::text[]");await c.query('INSERT INTO schema_migrations VALUES(3)');}
  if(!(await c.query('SELECT 1 FROM schema_migrations WHERE version=2')).rowCount){await c.query("ALTER TABLE contacts ADD COLUMN stage text NOT NULL DEFAULT 'nuevo', ADD COLUMN value numeric(14,2) NOT NULL DEFAULT 0, ADD COLUMN company_name text NOT NULL DEFAULT '', ADD COLUMN email text NOT NULL DEFAULT '', ADD COLUMN notes text NOT NULL DEFAULT ''");await c.query('INSERT INTO schema_migrations VALUES(2)');}
  const {BOOTSTRAP_EMAIL:e,BOOTSTRAP_PASSWORD:p,BOOTSTRAP_COMPANY:n}=process.env;
  if(!(await c.query('SELECT 1 FROM users LIMIT 1')).rowCount){
@@ -52,6 +53,11 @@ app.post(['/api/webhooks/evolution/:secret','/api/webhooks/evolution/:secret/:ev
  if(!secret||secret.length<32||!company||!instance||typeof q.params.secret!=='string'||hash(q.params.secret)!==hash(secret)){console.warn('Evolution webhook rejected: configuration or token');r.sendStatus(404);return;}
  const event=q.body,source=typeof event?.instance==='string'?event.instance:event?.instance?.instanceName??event?.instance?.name;
  const type=String(event?.event??q.params.event??'').toLowerCase().replace(/[_-]/g,'.');
+ if(source===instance&&type==='messages.update'){
+ const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];r.locals.company=company;
+ await tenant(r,async c=>{for(const item of items){const id=item?.key?.id??item?.keyId??item?.id;const status=item?.update?.status??item?.status;const rank=({SERVER_ACK:1,DELIVERY_ACK:2,READ:3,PLAYED:3,'2':1,'3':2,'4':3,'5':3} as Record<string,number>)[String(status).toUpperCase()];if(typeof id!=='string'||id.length>200||!rank)continue;
+ await c.query("UPDATE conversations SET data=jsonb_set(data,'{deliveryRank}',to_jsonb($2::int),true) WHERE data->>'providerId'=$1 AND data->>'direction'='sent' AND COALESCE((data->>'deliveryRank')::int,0)<$2",[id,rank]);}});r.json({ok:true});return;
+ }
  if(source!==instance||type!=='messages.upsert'){console.info('Evolution webhook ignored',{instanceMatches:source===instance,event:type.slice(0,80)});r.json({ok:true});return;}
  const raw=event.data?.messages??event.data;const items=Array.isArray(raw)?raw:[raw];let imported=0,skipped=0;
  r.locals.company=company;
@@ -85,6 +91,7 @@ app.get('/api/tenant/:company/activity',async(_q,r)=>{
  const rows=await tenant(r,async c=>(await c.query("SELECT data->>'phone' AS phone,max(created_at) AS last_contact,count(*) FILTER (WHERE data->>'direction'='received')::int AS received,count(*) FILTER (WHERE data->>'direction'='sent')::int AS sent FROM conversations WHERE data->>'phone' IS NOT NULL GROUP BY data->>'phone'")).rows);r.json(rows);
 });
 app.patch('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {stage,value,company_name,email,notes,name}=q.body??{};if(name!==undefined&&(typeof name!=='string'||!name.trim()||name.length>200)){r.sendStatus(400);return;}if(!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)||typeof value!=='number'||!Number.isFinite(value)||value<0||value>999999999999||![company_name,email,notes].every(x=>typeof x==='string'&&x.length<=2000)){r.sendStatus(400);return;}const x=await tenant(r,async c=>(await c.query('UPDATE contacts SET stage=$1,value=$2,company_name=$3,email=$4,notes=$5,name=COALESCE($7,name) WHERE id=$6 RETURNING *',[stage,value,company_name,email,notes,q.params.id,name?.trim()??null])).rows[0]);if(!x){r.sendStatus(404);return;}r.json(x);});
+app.post('/api/tenant/:company/contacts/:id/labels',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const labels=q.body?.labels;if(!Array.isArray(labels)||labels.length>20||!labels.every(x=>typeof x==='string'&&x.trim().length>0&&x.trim().length<=40)){r.sendStatus(400);return;}const clean=[...new Set(labels.map(x=>x.trim()))];const row=await tenant(r,async c=>(await c.query('UPDATE contacts SET labels=$1 WHERE id=$2 RETURNING labels',[clean,q.params.id])).rows[0]);if(!row){r.sendStatus(404);return;}r.json(row);});
 app.delete('/api/tenant/:company/contacts/:id',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('DELETE FROM contacts WHERE id=$1',[q.params.id]));r.json({ok:true});});
 async function evolution(r:TenantContext,path:string,body?:unknown,method?:string){
  const {EVOLUTION_URL:base,EVOLUTION_API_KEY:key,EVOLUTION_INSTANCE:instance,EVOLUTION_COMPANY_ID:company}=process.env;
@@ -147,6 +154,14 @@ app.post('/api/tenant/:company/whatsapp/send-media',rateLimit({windowMs:60000,li
  const result=kind==='audio'&&ptt?await evolution(r,'/message/sendWhatsAppAudio',{number:phone,audio:base64}):await evolution(r,'/message/sendMedia',{number:phone,mediatype:kind,mimetype:mime,media:base64,caption,fileName:'archivo.'+mime.split('/')[1]});
  await tenant(r,async c=>c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[r.locals.company,phone,JSON.stringify({phone,text:caption||'['+kind+']',direction:'sent',providerId:result.key?.id,media:{kind,mime,ptt},mediaBase64:base64})]));r.json({ok:true});
 });
+app.get('/api/tenant/:company/whatsapp/queue',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,created_at,data - 'payload' AS data FROM automations WHERE data->>'kind'='outbound_text' ORDER BY created_at DESC LIMIT 200")).rows)));
+app.post('/api/tenant/:company/whatsapp/queue',rateLimit({windowMs:60000,limit:20}),async(q,r)=>{
+ if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text,requestId}=q.body??{};
+ if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000||typeof requestId!=='string'||! /^[0-9a-f-]{36}$/i.test(requestId)){r.sendStatus(400);return;}
+ if(r.locals.company!==process.env.EVOLUTION_COMPANY_ID){r.status(400).json({error:'Evolution no configurado'});return;}
+ const row=await tenant(r,async c=>{await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[r.locals.company+':queue:'+requestId]);const old=(await c.query("SELECT id FROM automations WHERE data->>'kind'='outbound_text' AND data->>'requestId'=$1",[requestId])).rows[0];if(old)return old;
+ return (await c.query("INSERT INTO automations(company_id,title,data) VALUES($1,$2,$3) RETURNING id",[r.locals.company,phone,JSON.stringify({kind:'outbound_text',requestId,phone,text,state:'pending'})])).rows[0];});r.status(202).json(row);
+});
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text,replyId}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
  const allowed=await tenant(r,async c=>{
  await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);
@@ -177,3 +192,9 @@ app.listen(Number(process.env.PORT??3000),'0.0.0.0');
 async function automaticSync(){const company=process.env.EVOLUTION_COMPANY_ID;if(!company||!process.env.EVOLUTION_URL||!process.env.EVOLUTION_API_KEY||!process.env.EVOLUTION_INSTANCE)return;try{const x=await sharedSync(company);if(x.imported)console.info('Evolution automatic sync',{imported:x.imported});}catch(e){console.warn('Evolution automatic sync failed',e instanceof Error&&/^Evolution respondió HTTP \\d{3}$/.test(e.message)?e.message:'provider or database unavailable');}finally{setTimeout(automaticSync,5000).unref();}}
 if(process.env.EVOLUTION_COMPANY_ID){console.info('Evolution automatic sync enabled (5s after each cycle)');void automaticSync();}
 
+
+async function outboundWorker(){const company=process.env.EVOLUTION_COMPANY_ID;if(!company)return;const ctx={locals:{company}};try{
+ const job:any=await tenant(ctx,async c=>(await c.query("UPDATE automations SET data=data || jsonb_build_object('state','processing','startedAt',now()) WHERE id=(SELECT id FROM automations WHERE data->>'kind'='outbound_text' AND data->>'state'='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,data")).rows[0]);
+ if(job){let state='uncertain',error='Envío sin confirmar; revisar historial antes de reenviar';try{const allowed=await tenant(ctx,async c=>!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND opted_out',[job.data.phone])).rowCount);if(!allowed){state='failed';error='Destinatario excluido';}else{const result=await evolution(ctx,'/message/sendText',{number:job.data.phone,text:job.data.text});await tenant(ctx,async c=>{await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$2) ON CONFLICT(company_id,phone) DO NOTHING',[company,job.data.phone]);await c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[company,job.data.phone,JSON.stringify({phone:job.data.phone,text:job.data.text,direction:'sent',providerId:result.key?.id})]);await c.query("UPDATE automations SET data=data || jsonb_build_object('state','sent','finishedAt',now()) WHERE id=$1",[job.id]);});state='sent';}}catch{}if(state!=='sent')await tenant(ctx,async c=>c.query("UPDATE automations SET data=data || jsonb_build_object('state',$2::text,'error',$3::text,'finishedAt',now()) WHERE id=$1",[job.id,state,error]));}
+ }catch{console.warn('Outbound queue worker failed');}finally{setTimeout(outboundWorker,3000).unref();}}
+if(process.env.EVOLUTION_COMPANY_ID)void outboundWorker();
