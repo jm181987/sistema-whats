@@ -120,7 +120,7 @@ async function evolutionGlobal(path:string,body?:unknown,method?:string){
 function instanceName(company:string){return 'sw-'+company.toLowerCase();}
 async function configuredInstance(company:string){return !!(await tenant({locals:{company}},async c=>(await c.query("SELECT id FROM connections WHERE data->>'kind'='evolution' LIMIT 1")).rows[0]));}
 async function evolution(r:TenantContext,path:string,body?:unknown,method?:string){const company=r.locals.company;if(!company||!await configuredInstance(company))throw Error('Creá una instancia de WhatsApp primero');return evolutionGlobal(path+'/'+encodeURIComponent(instanceName(company)),body,method);}
-app.get('/api/tenant/:company/whatsapp/config',async(_q,r)=>{const configured=await configuredInstance(r.locals.company);r.json({url:process.env.EVOLUTION_URL??'',instance:configured?instanceName(r.locals.company):'',keyConfigured:!!process.env.EVOLUTION_API_KEY});});
+app.get('/api/tenant/:company/whatsapp/config',async(_q,r)=>{const configured=await configuredInstance(r.locals.company);r.json({canManage:['owner','admin'].includes(r.locals.role),configured:!!configured,...(r.locals.globalAdmin?{url:process.env.EVOLUTION_URL??'',instance:configured?instanceName(r.locals.company):'',keyConfigured:!!process.env.EVOLUTION_API_KEY}:{})});});
 app.post('/api/tenant/:company/whatsapp/create-instance',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.status(403).json({error:'Solo el administrador global, owner o admin puede crear instancias'});return;}
  const company=r.locals.company,name=instanceName(company),secret=process.env.EVOLUTION_WEBHOOK_SECRET,base=process.env.PUBLIC_APP_URL;
@@ -137,7 +137,7 @@ app.get('/api/tenant/:company/whatsapp/profile-photo/:phone',rateLimit({windowMs
 });
 app.get('/api/tenant/:company/whatsapp/status',async(_q,r)=>{try{const x=await evolution(r,'/instance/connectionState');r.json({state:x.instance?.state??x.state??'unknown'});}catch{r.json({state:'unavailable'});}});
 app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit:10}),async(_q,r)=>{
- if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ if(!['owner','admin'].includes(r.locals.role)){r.status(403).json({error:'Solo el administrador global, owner o admin puede vincular o desvincular WhatsApp'});return;}
  try{const state=await evolution(r,'/instance/connectionState').catch(()=>null);if((state?.instance?.state??state?.state)==='open'){r.json({state:'open'});return;}
  const x=await evolution(r,'/instance/connect');const raw=x.base64??x.qrcode?.base64??x.data?.base64??x.data?.qrcode?.base64;
  const image=typeof raw==='string'&&raw.length<2000000?raw.trim():'';
@@ -150,7 +150,7 @@ app.post('/api/tenant/:company/whatsapp/connect',rateLimit({windowMs:60000,limit
  }catch(e){const msg=e instanceof Error?e.message:'';r.status(502).json({error:/^(Revisá EVOLUTION_|EVOLUTION_URL debe|Evolution respondió HTTP \d{3}$)/.test(msg)?msg:'No se pudo comunicar con Evolution. Revisá red, puerto, certificado si usás HTTPS y disponibilidad.'});}
 });
 app.post('/api/tenant/:company/whatsapp/disconnect',rateLimit({windowMs:60000,limit:5}),async(_q,r)=>{
- if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
+ if(!['owner','admin'].includes(r.locals.role)){r.status(403).json({error:'Solo el administrador global, owner o admin puede vincular o desvincular WhatsApp'});return;}
  try{await evolution(r,'/instance/logout',undefined,'DELETE');r.json({ok:true});}catch{r.status(502).json({error:'No se pudo desvincular WhatsApp'});}
 });
 async function syncEvolution(r:TenantContext){
