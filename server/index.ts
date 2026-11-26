@@ -118,13 +118,9 @@ app.post('/api/tenant/:company/whatsapp/sync',async(_q,r)=>{
 app.get('/api/tenant/:company/whatsapp/messages',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT id,title,data,created_at FROM conversations ORDER BY created_at DESC LIMIT 500")).rows)));
 app.post('/api/tenant/:company/whatsapp/send',async(q,r)=>{if(r.locals.role==='viewer'){r.sendStatus(403);return;}const {phone,text}=q.body??{};if(typeof phone!=='string'||! /^[1-9]\d{7,14}$/.test(phone)||typeof text!=='string'||!text.trim()||text.length>4000){r.sendStatus(400);return;}
  const allowed=await tenant(r,async c=>{
- const existing=(await c.query('SELECT consent_at,opted_out FROM contacts WHERE phone=$1',[phone])).rows[0];
- if(existing?.opted_out)return false;
- if(existing?.consent_at)return true;
- if(q.body.manual!==true||q.body.authorized!==true)return false;
- await c.query('INSERT INTO contacts(company_id,name,phone,consent_at) VALUES($1,$2,$3,now()) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);
- return !!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND consent_at IS NOT NULL AND NOT opted_out',[phone])).rowCount;
- });if(!allowed){r.status(403).json({error:'El destinatario no tiene autorización registrada o ha solicitado no recibir mensajes.'});return;}
+ await c.query('INSERT INTO contacts(company_id,name,phone) VALUES($1,$2,$3) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,phone,phone]);
+ return !!(await c.query('SELECT id FROM contacts WHERE phone=$1 AND NOT opted_out',[phone])).rowCount;
+ });if(!allowed){r.status(403).json({error:'El destinatario ha solicitado no recibir mensajes.'});return;}
  const result=await evolution(r,'/message/sendText',{number:phone,text});await tenant(r,async c=>c.query('INSERT INTO conversations(company_id,title,data) VALUES($1,$2,$3)',[r.locals.company,phone,JSON.stringify({phone,text,direction:'sent',providerId:result.key?.id})]));r.json({ok:true});});
 app.post('/api/tenant/:company/contacts/:id/consent',async(q,r)=>{if(!['owner','admin'].includes(r.locals.role)||typeof q.body?.consent!=='boolean'){r.sendStatus(403);return;}await tenant(r,async c=>c.query('UPDATE contacts SET consent_at=CASE WHEN $1 THEN now() ELSE NULL END,opted_out=NOT $1 WHERE id=$2',[q.body.consent,q.params.id]));r.json({ok:true});});
 app.get('/api/tenant/:company/tasks',async(_q,r)=>r.json(await tenant(r,async c=>(await c.query("SELECT a.*,c.name AS contact_name,c.phone FROM appointments a LEFT JOIN contacts c ON c.id::text=a.data->>'contactId' WHERE a.data->>'kind'='task' ORDER BY a.data->>'due' LIMIT 1000")).rows)));
