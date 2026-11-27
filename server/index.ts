@@ -96,13 +96,14 @@ app.post('/api/tenant/:company/contacts',async(q,r)=>{if(r.locals.role==='viewer
 app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
  const rows=q.body?.leads;if(!Array.isArray(rows)||rows.length>100){r.sendStatus(400);return;}
- let added=0,skipped=0,duplicates=0;
+ let added=0,skipped=0,duplicates=0,updated=0;
  await tenant(r,async c=>{for(const l of rows){const phone=typeof l?.phone==='string'?l.phone.replace(/[+ ()-]/g,''):'',name=typeof l?.name==='string'?l.name.trim():'',value=Number(l?.value??0),stage=l?.stage??'nuevo';
  if(!name||name.length>200||!/^[1-9]\d{7,14}$/.test(phone)||!Number.isFinite(value)||value<0||value>999999999999||!['nuevo','calificado','propuesta','cierre','cliente'].includes(stage)){skipped++;continue;}
  const fields=[l.company_name??l.company??'',l.email??'',l.notes??''];if(!fields.every(x=>typeof x==='string'&&x.length<=2000)){skipped++;continue;}
  const date=new Date(l.createdAt??l.created_at??Date.now());if(!Number.isFinite(date.getTime())){skipped++;continue;}
- const x=await c.query('INSERT INTO contacts(company_id,name,phone,stage,value,company_name,email,notes,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,name,phone,stage,value,...fields,date]);added+=x.rowCount??0;duplicates+=1-(x.rowCount??0);
- }});r.json({added,skipped,duplicates});
+ const x=await c.query('INSERT INTO contacts(company_id,name,phone,stage,value,company_name,email,notes,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(company_id,phone) DO NOTHING',[r.locals.company,name,phone,stage,value,...fields,date]);if(x.rowCount){added++;continue;}
+ const changed=await c.query("UPDATE contacts SET name=CASE WHEN name=phone OR btrim(name)='' THEN $2 ELSE name END, company_name=CASE WHEN btrim(company_name)='' THEN $3 ELSE company_name END, email=CASE WHEN btrim(email)='' THEN $4 ELSE email END, notes=CASE WHEN btrim(notes)='' THEN $5 ELSE notes END WHERE company_id=$1 AND phone=$6 AND (( (name=phone OR btrim(name)='') AND name IS DISTINCT FROM $2) OR (btrim(company_name)='' AND $3<>'') OR (btrim(email)='' AND $4<>'') OR (btrim(notes)='' AND $5<>''))",[r.locals.company,name,...fields,phone]);if(changed.rowCount)updated++;else duplicates++;
+ }});r.json({added,skipped,duplicates,updated});
 });
 app.get('/api/tenant/:company/contacts/export',async(_q,r)=>{r.json({leads:await tenant(r,async c=>(await c.query('SELECT name,phone,stage,value,company_name AS company,email,notes,created_at AS "createdAt" FROM contacts ORDER BY created_at')).rows),exportDate:new Date().toISOString()});});
 app.get('/api/tenant/:company/activity',async(_q,r)=>{
