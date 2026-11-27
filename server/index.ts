@@ -103,7 +103,7 @@ app.post('/api/tenant/:company/contacts',async(q,r)=>{
  if(inserted.rowCount)return {...inserted.rows[0],created:true};
  const existing=await c.query("UPDATE contacts SET name=CASE WHEN name=phone OR btrim(name)='' THEN $2 ELSE name END,company_name=CASE WHEN btrim(company_name)='' THEN $4 ELSE company_name END,email=CASE WHEN btrim(email)='' THEN $5 ELSE email END,notes=CASE WHEN btrim(notes)='' THEN $6 ELSE notes END WHERE company_id=$1 AND phone=$3 RETURNING *",[r.locals.company,name,phone,...fields]);
  if(!existing.rowCount)throw Error('Contact no longer exists');return {...existing.rows[0],created:false};
- });r.status(row.created?201:200).json(row);
+ });r.status((row as {created:boolean}).created?201:200).json(row);
 });
 app.post('/api/tenant/:company/contacts/import',async(q,r)=>{
  if(!['owner','admin'].includes(r.locals.role)){r.sendStatus(403);return;}
